@@ -9,6 +9,9 @@ Given two Wikipedia article titles, find the shortest path of links between them
 Pour l'instant le cache est stocké dans un fichier JSON local, mais on peut envisager d'utiliser une base de données pour de meilleures performances et une plus grande échelle.
 """
 link_seen = 0
+paths = {}
+DESACTIVATE_DATES = False
+DESACTIVATE_DATES = True 
 
 def get_links(title):
 
@@ -38,17 +41,15 @@ def get_links(title):
     for page in pages.values():
         if "links" in page:
             for link in page["links"]:
-                # filtre anti-triche
-                # if ":" in title:  # évite Aide:, Catégorie:, etc.
-                #     continue
-                # if "homonymie" in title.lower():
-                #     continue
+                if DESACTIVATE_DATES and link["title"].isdigit():
+                    continue
+                if DESACTIVATE_DATES and link["title"][:4].isdigit():
+                    continue
                 links.append(link["title"].replace(" ", "_"))
     # print(f"Fetched {len(links)} links for {title}")
 
     return links
 
-paths = {}
 
 def search(start, end):
     print(f"Searching path from '{start}' to '{end}'...")
@@ -120,9 +121,14 @@ def search_bidirectional(start, end):
 
 
 if __name__ == "__main__":
-
+    page1 = "Pelagia_noctiluca"
+    page2 = "Nylon"
     # path = search("Crevette", "Seconde_Guerre_mondiale")
-    path = search_bidirectional("Crevette", "C_(langage)")
+    # path = search_bidirectional("Crevette", "C_(langage)")
+    # path = search_bidirectional("Pelagia_notiluca", "Nylon")
+    # path = search_bidirectional("Crevette", "Nylon")
+    # path = search_bidirectional("Pelagia_notiluca", "Crevette")
+    path = search_bidirectional(page1, page2)
     # path = search("Python_(langage)", "C_(langage)")
     # print(" -> ".join(path) if path else "No path found")
     # path = search("Python_(langage)", "1989")
@@ -130,6 +136,10 @@ if __name__ == "__main__":
     if path:
         print("Path found in {} links (searched {} links):".format(len(path)-1, link_seen))
         print(" -> ".join(path))
-    else:        print("No path found")
+    else:        
+        print("No path found")
+        # on affiche les url pour verifier
+        print("Searched links:")
+        print("http://fr.wikipedia.org/wiki/" + page1)
 
     # print(paths)

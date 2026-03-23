@@ -1,0 +1,5 @@
+# La table des pages (id ↔ titre)
+wget https://dumps.wikimedia.org/frwiki/latest/frwiki-latest-page.sql.gz
+
+# La table des liens (source_id → target_title)
+wget https://dumps.wikimedia.org/frwiki/latest/frwiki-latest-pagelinks.sql.gz
