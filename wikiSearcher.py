@@ -123,11 +123,17 @@ def search_bidirectional(start, end):
 if __name__ == "__main__":
     page1 = "Pelagia_noctiluca"
     page2 = "Nylon"
+    page1 = "Musa_acuminata"
+    page2 = "Emmanuel_Macron"
     # path = search("Crevette", "Seconde_Guerre_mondiale")
     # path = search_bidirectional("Crevette", "C_(langage)")
     # path = search_bidirectional("Pelagia_notiluca", "Nylon")
     # path = search_bidirectional("Crevette", "Nylon")
     # path = search_bidirectional("Pelagia_notiluca", "Crevette")
+    import sys
+    if len(sys.argv) >= 3:
+        page1 = sys.argv[1]
+        page2 = sys.argv[2]
     path = search_bidirectional(page1, page2)
     # path = search("Python_(langage)", "C_(langage)")
     # print(" -> ".join(path) if path else "No path found")
