@@ -6,7 +6,7 @@
    Configuration
    ───────────────────────────────────────────── */
 #define MAX_PAGES      5000000
-#define MAX_LINKS      100000000
+#define MAX_LINKS      250000000
 #define NAME_BUF_SIZE  256000000  /* pool de chars pour les noms (~256 Mo) */
 #define HASH_SIZE      (1 << 23)  /* ~8M buckets, doit être puissance de 2 */
 #define HASH_MASK      (HASH_SIZE - 1)
@@ -202,7 +202,8 @@ static void load_links(const char *filename)
         if (si == -1) { skipped_src++; continue; }
         if (di == -1) { skipped_dst++; continue; }
 
-        add_edge(si, di);
+        /* Le dump wiki stocke (page_liée, page_source) — on inverse */
+        add_edge(di, si);
         total++;
     }
     fclose(f);
@@ -332,6 +333,5 @@ int main(int argc, char *argv[])
 
     return 0;
 }
-
 // gcc -O2 -o wiki_bfs wiki_bfs.c
 // ./wiki_bfs pages_ns0.txt liens_ns0.txt "Philosophie" "Mathématiques"

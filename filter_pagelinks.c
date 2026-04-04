@@ -1,21 +1,15 @@
 /*
- * filter_pagelinks.c  –  version bitset
- * --------------------------------------
+ * filter_pagelinks.c  –  version lt_map
+ * ---------------------------------------
  * Filtre un dump SQL MariaDB `pagelinks` (Wikipedia) pour ne garder
- * que les liens entre pages du namespace 0.
+ * que les liens entre pages du namespace 0, en résolvant pl_target_id
+ * via lt_map.output (lt_id → page_id).
  *
  * Compilation :
  *   gcc -O2 -o filter_pagelinks filter_pagelinks.c
  *
  * Usage :
- *   ./filter_pagelinks ids.txt pagelinks.sql output.txt
- *
- * Sortie : une paire par ligne →  (id_origine,id_dest)
- *
- * Stratégie :
- *   - Bitset de (MAX_ID / 64) uint64_t  →  ~2 Mo, tient en cache L2/L3
- *   - Parser manuel des lignes INSERT, sans regex, sans malloc par tuple
- *   - I/O bufférisées (8 Mo en lecture, buffer texte 4 Mo en écriture)
+ *   ./filter_pagelinks pages_ns0.output lt_map.output pagelinks.sql liens_ns0.output
  */
 
 #include <stdio.h>
@@ -27,40 +21,39 @@
 /* ------------------------------------------------------------------ */
 /* Paramètres                                                           */
 /* ------------------------------------------------------------------ */
+#define MAX_PAGE_ID     18000000UL
+#define MAX_LT_ID       32000000UL
 
-/* ID maximum connu + marge de sécurité                               */
-#define MAX_ID          18000000UL
+#define BITSET_WORDS    ((MAX_PAGE_ID + 63) / 64)
 
-/* Nombre de mots de 64 bits nécessaires                              */
-#define BITSET_WORDS    ((MAX_ID + 63) / 64)
-
-/* Taille des buffers I/O                                             */
-#define IO_BUF_SIZE     (8 * 1024 * 1024)   /* 8 Mo lecture SQL       */
-#define OUT_BUF_SIZE    (4 * 1024 * 1024)   /* 4 Mo écriture résultat */
-
-/* Fréquence d'affichage de la progression (en tuples)               */
-#define REPORT_EVERY    10000000UL
+#define IO_BUF_SIZE     (8 * 1024 * 1024)
+#define OUT_BUF_SIZE    (4 * 1024 * 1024)
+#define LINE_CAP        (64 * 1024 * 1024)
 
 /* ------------------------------------------------------------------ */
-/* Bitset                                                              */
+/* Bitset pour pl_from (page_id valides)                               */
 /* ------------------------------------------------------------------ */
-
-static uint64_t bitset[BITSET_WORDS];   /* ~2.1 Mo sur la pile globale */
+static uint64_t bitset[BITSET_WORDS];
 
 static inline void bitset_set(unsigned long id)
 {
-    bitset[id >> 6] |= (uint64_t)1 << (id & 63);
+    if (id < MAX_PAGE_ID)
+        bitset[id >> 6] |= (uint64_t)1 << (id & 63);
 }
 
 static inline int bitset_test(unsigned long id)
 {
-    if (id >= MAX_ID) return 0;
+    if (id >= MAX_PAGE_ID) return 0;
     return (bitset[id >> 6] >> (id & 63)) & 1;
 }
 
 /* ------------------------------------------------------------------ */
+/* Tableau direct lt_id → page_id (0 = non résolu)                    */
+/* ------------------------------------------------------------------ */
+static int *lt_map = NULL;
+
+/* ------------------------------------------------------------------ */
 /* Lecture rapide d'un entier non-signé                                */
-/* Retourne le pointeur après le dernier chiffre lu.                  */
 /* ------------------------------------------------------------------ */
 static inline const char *parse_uint(const char *p, unsigned long *out)
 {
@@ -72,19 +65,48 @@ static inline const char *parse_uint(const char *p, unsigned long *out)
 }
 
 /* ------------------------------------------------------------------ */
-/* Chargement des IDs valides dans le bitset                           */
+/* Chargement pages_ns0.output → bitset                                */
 /* ------------------------------------------------------------------ */
-static long load_ids(const char *path)
+static long load_pages(const char *path, char *io_buf)
 {
     FILE *f = fopen(path, "r");
     if (!f) { perror(path); exit(1); }
+    setvbuf(f, io_buf, _IOFBF, IO_BUF_SIZE);
 
-    char line[32];
+    char line[256];
     long count = 0;
     while (fgets(line, sizeof(line), f)) {
-        unsigned long id = strtoul(line, NULL, 10);
-        if (id > 0 && id < MAX_ID) {
-            bitset_set(id);
+        if (line[0] != '(') continue;
+        unsigned long id;
+        parse_uint(line + 1, &id);
+        bitset_set(id);
+        count++;
+    }
+    fclose(f);
+    return count;
+}
+
+/* ------------------------------------------------------------------ */
+/* Chargement lt_map.output → tableau lt_id → page_id                 */
+/* ------------------------------------------------------------------ */
+static long load_lt_map(const char *path, char *io_buf)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { perror(path); exit(1); }
+    setvbuf(f, io_buf, _IOFBF, IO_BUF_SIZE);
+
+    char line[64];
+    long count = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] != '(') continue;
+        const char *p = line + 1;
+        unsigned long lt_id, page_id;
+        p = parse_uint(p, &lt_id);
+        if (*p != ',') continue;
+        p++;
+        parse_uint(p, &page_id);
+        if (lt_id < MAX_LT_ID && page_id > 0) {
+            lt_map[lt_id] = (int)page_id;
             count++;
         }
     }
@@ -95,11 +117,13 @@ static long load_ids(const char *path)
 /* ------------------------------------------------------------------ */
 /* Traitement d'une ligne INSERT                                        */
 /* ------------------------------------------------------------------ */
+static size_t g_out_pos = 0;  /* position globale dans out_buf */
+
 static void process_insert(const char *line,
                             char       *out_buf,
-                            size_t     *out_pos,
                             FILE       *out_fp,
-                            long       *written)
+                            long       *written,
+                            long       *skipped)
 {
     const char *p = strstr(line, "VALUES ");
     if (!p) return;
@@ -108,28 +132,25 @@ static void process_insert(const char *line,
     unsigned long pl_from, pl_from_ns, pl_target_id;
 
     while (*p) {
-        /* cherche '(' */
         while (*p && *p != '(') p++;
         if (!*p) break;
         p++;
 
         p = parse_uint(p, &pl_from);
-        if (*p != ',') break;
-        p++;
+        if (*p != ',') { break; } p++;
 
         p = parse_uint(p, &pl_from_ns);
-        if (*p != ',') break;
-        p++;
+        if (*p != ',') { break; } p++;
 
         p = parse_uint(p, &pl_target_id);
 
-        /* Filtre : namespace 0, les deux IDs dans le bitset */
         if (pl_from_ns == 0
                 && bitset_test(pl_from)
-                && bitset_test(pl_target_id))
+                && pl_target_id < MAX_LT_ID
+                && lt_map[pl_target_id] != 0)
         {
-            /* itoa sans snprintf : écrit les chiffres en sens inverse */
-            /* puis inverse, plus rapide que snprintf sur 300M appels  */
+            int dst_id = lt_map[pl_target_id];
+
             char tmp[64];
             char digits[20];
             int  rlen;
@@ -137,36 +158,31 @@ static void process_insert(const char *line,
             char *t = tmp;
 
             *t++ = '(';
-
-            /* pl_from */
             v = pl_from; rlen = 0;
             if (v == 0) { digits[rlen++] = '0'; }
             else { while (v) { digits[rlen++] = '0' + (v % 10); v /= 10; } }
             for (int i = rlen - 1; i >= 0; i--) *t++ = digits[i];
 
             *t++ = ',';
-
-            /* pl_target_id */
-            v = pl_target_id; rlen = 0;
+            v = (unsigned long)dst_id; rlen = 0;
             if (v == 0) { digits[rlen++] = '0'; }
             else { while (v) { digits[rlen++] = '0' + (v % 10); v /= 10; } }
             for (int i = rlen - 1; i >= 0; i--) *t++ = digits[i];
 
-            *t++ = ')';
-            *t++ = '\n';
+            *t++ = ')'; *t++ = '\n';
 
             size_t len = (size_t)(t - tmp);
-
-            if (*out_pos + len > OUT_BUF_SIZE) {
-                fwrite(out_buf, 1, *out_pos, out_fp);
-                *out_pos = 0;
+            if (g_out_pos + len > OUT_BUF_SIZE) {
+                fwrite(out_buf, 1, g_out_pos, out_fp);
+                g_out_pos = 0;
             }
-            memcpy(out_buf + *out_pos, tmp, len);
-            *out_pos += len;
+            memcpy(out_buf + g_out_pos, tmp, len);
+            g_out_pos += len;
             (*written)++;
+        } else {
+            (*skipped)++;
         }
 
-        /* avance jusqu'après ')' */
         while (*p && *p != ')') p++;
         if (*p == ')') p++;
     }
@@ -177,88 +193,81 @@ static void process_insert(const char *line,
 /* ------------------------------------------------------------------ */
 int main(int argc, char *argv[])
 {
-    if (argc != 4) {
-        fprintf(stderr, "Usage: %s ids.txt pagelinks.sql output.txt\n", argv[0]);
+    if (argc != 5) {
+        fprintf(stderr,
+            "Usage: %s pages_ns0.output lt_map.output pagelinks.sql liens_ns0.output\n",
+            argv[0]);
         return 1;
     }
 
-    /* --- 1. Chargement des IDs --- */
-    printf("[1/3] Chargement des IDs depuis '%s' …\n", argv[1]);
-    fflush(stdout);
-    long id_count = load_ids(argv[1]);
-    printf("      %ld IDs chargés  (bitset ~%.1f Mo).\n",
-           id_count, BITSET_WORDS * 8.0 / (1024 * 1024));
-
-    /* --- 2. Ouverture des fichiers --- */
-    FILE *sql_fp = fopen(argv[2], "r");
-    if (!sql_fp) { perror(argv[2]); return 1; }
-
-    FILE *out_fp = fopen(argv[3], "w");
-    if (!out_fp) { perror(argv[3]); return 1; }
-
-    char *sql_buf = malloc(IO_BUF_SIZE);
+    char *io_buf  = malloc(IO_BUF_SIZE);
     char *out_buf = malloc(OUT_BUF_SIZE);
-    if (!sql_buf || !out_buf) { fprintf(stderr, "malloc failed\n"); return 1; }
-    setvbuf(sql_fp, sql_buf, _IOFBF, IO_BUF_SIZE);
+    char *line    = malloc(LINE_CAP);
+    lt_map        = calloc(MAX_LT_ID, sizeof(int));
+    if (!io_buf || !out_buf || !line || !lt_map) { perror("malloc"); return 1; }
 
-    /* Les lignes INSERT peuvent faire plusieurs dizaines de Mo        */
-    size_t line_cap = 64 * 1024 * 1024;
-    char  *line_buf = malloc(line_cap);
-    if (!line_buf) { fprintf(stderr, "malloc line_buf failed\n"); return 1; }
+    /* 1. Bitset des page_id valides */
+    printf("[1/4] Chargement des pages '%s'...\n", argv[1]); fflush(stdout);
+    long page_count = load_pages(argv[1], io_buf);
+    printf("      %ld pages chargées (bitset %.1f Mo)\n",
+           page_count, BITSET_WORDS * 8.0 / (1024 * 1024));
 
-    /* --- 3. Parsing --- */
-    printf("[2/3] Lecture de '%s' …\n", argv[2]);
-    fflush(stdout);
+    /* 2. Tableau lt_id → page_id */
+    printf("[2/4] Chargement du lt_map '%s'...\n", argv[2]); fflush(stdout);
+    long lt_count = load_lt_map(argv[2], io_buf);
+    printf("      %ld entrées lt_map chargées (tableau %.0f Mo)\n",
+           lt_count, MAX_LT_ID * sizeof(int) / (1024.0 * 1024));
 
-    long   written = 0;
-    long   total   = 0;
-    size_t out_pos = 0;
-    clock_t t0     = clock();
-    clock_t last   = t0;
+    /* 3. Ouverture fichiers SQL et sortie */
+    FILE *sql_fp = fopen(argv[3], "r");
+    if (!sql_fp) { perror(argv[3]); return 1; }
+    FILE *out_fp = fopen(argv[4], "w");
+    if (!out_fp) { perror(argv[4]); return 1; }
+    setvbuf(sql_fp, io_buf, _IOFBF, IO_BUF_SIZE);
 
-    while (fgets(line_buf, (int)line_cap, sql_fp)) {
-        if (strncmp(line_buf, "INSERT INTO", 11) != 0)
-            continue;
+    /* 4. Parsing */
+    printf("[3/4] Lecture de '%s'...\n", argv[3]); fflush(stdout);
 
-        /* Compte les tuples (approximatif : nombre de '(')            */
-        const char *s = line_buf;
-        long line_tuples = 0;
-        while ((s = strchr(s, '(')) != NULL) { line_tuples++; s++; }
-        total += line_tuples;
+    long    written = 0, skipped = 0, total = 0;
+    clock_t t0 = clock(), last = t0;
 
-        process_insert(line_buf, out_buf, &out_pos, out_fp, &written);
+    while (fgets(line, LINE_CAP, sql_fp)) {
+        if (strncmp(line, "INSERT INTO", 11) != 0) continue;
+
+        /* Compte approximatif des tuples */
+        const char *s = line; long lt = 0;
+        while ((s = strchr(s, '(')) != NULL) { lt++; s++; }
+        total += lt;
+
+        process_insert(line, out_buf, out_fp, &written, &skipped);
 
         clock_t now = clock();
         if ((double)(now - last) / CLOCKS_PER_SEC >= 5.0) {
             double elapsed = (double)(now - t0) / CLOCKS_PER_SEC;
             printf("      %.0fM tuples | %ld conservés | %.1f M/s | %.0fs\n",
-                   total / 1e6, written,
-                   total / elapsed / 1e6, elapsed);
+                   total / 1e6, written, total / elapsed / 1e6, elapsed);
             fflush(stdout);
             last = now;
         }
     }
 
     /* Flush final */
-    if (out_pos > 0)
-        fwrite(out_buf, 1, out_pos, out_fp);
-
+    if (g_out_pos > 0) fwrite(out_buf, 1, g_out_pos, out_fp);
     fclose(sql_fp);
     fclose(out_fp);
-    free(sql_buf);
-    free(out_buf);
-    free(line_buf);
 
     double elapsed = (double)(clock() - t0) / CLOCKS_PER_SEC;
-    printf("[3/3] Terminé en %.1fs — %.2f M tuples/s\n",
+    printf("[4/4] Terminé en %.1fs — %.2f M tuples/s\n",
            elapsed, total / elapsed / 1e6);
     printf("      ✓ %ld paires conservées\n", written);
-    printf("      ✗ %ld tuples filtrés\n", total - written);
+    printf("      ✗ %ld tuples filtrés\n",    skipped);
 
+    free(io_buf); free(out_buf); free(line); free(lt_map);
     return 0;
 }
 
-// gcc -O2 -o filter_pagelinks filter_pagelinks.c
-// ./filter_pagelinks ids.txt pagelinks.sql output.txt
 
-// ./filter_pagelinks frwiki-page-namespace0-ids.txt frwiki-latest-pagelinks.sql output.txt
+/*
+gcc -O2 -o filter_pagelinks filter_pagelinks.c
+./filter_pagelinks pages_ns0.output lt_map.output frwiki-latest-pagelinks.sql liens_ns0.output
+*/

@@ -81,6 +81,7 @@ def search(start, end):
             
 
 def search_bidirectional(start, end):
+    """Bidirectional BFS for Wikipedia path finding."""
     if start == end:
         return [start]
 
