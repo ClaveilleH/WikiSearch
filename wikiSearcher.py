@@ -95,6 +95,8 @@ def search_bidirectional(start, end):
     paths = {start: [start], end: [end]}
 
     while queue_front and queue_back:
+        if link_seen % 100 == 0:
+            print("Links seen so far :", link_seen)
         if queue_front:
             current_front = queue_front.popleft()
             links_front = get_links(current_front)
@@ -126,6 +128,8 @@ if __name__ == "__main__":
     page2 = "Nylon"
     page1 = "Musa_acuminata"
     page2 = "Emmanuel_Macron"
+    page1, page2 = "lama", "escalier"
+    page1, page2 = "escalier", "lama"
     # path = search("Crevette", "Seconde_Guerre_mondiale")
     # path = search_bidirectional("Crevette", "C_(langage)")
     # path = search_bidirectional("Pelagia_notiluca", "Nylon")
